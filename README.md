@@ -330,13 +330,70 @@ Dapat dilihat dari gambar di atas, untuk pengetesan tanpa load balancer dimulai 
 
 Warna hijau, biru tua, dan abu-abu masing-masing menunjukkan node wprofile1, wprofile2, dan wprofile3 untuk layanan web profile. Warna pink menunjukkan node master sebagai load balancer. Secara keseluruhan, dibandingkan dengan concurrent request dengan load balancer, aktivitas server cenderung lebih berat dari sisi CPU utilization dan network.
 
-## Berbagai masalah yang muncul
+## Berbagai Masalah dan Solusi Teknis
 
-- Wordpress tidak dapat dibuka apabila dilakukan penyetingan menggunakan `nodeSelector`. Tanpa adanya setting tersebut, pod wordpress dapat dijalankan, tetapi akan dideploy pada node dengan label random yang tersedia. 
-- Apabila dijalankan beberapa MySQL pada node db, terkadang muncul konflik sehingga sebagian pod lainnya akan berhenti dan error. Alasan yang mungkin adalah karena salah setting pada persistance volume. Terdapat berbagai jenis persistance volume dan penyusun laporan ini belum benar-benar memahami berbagai jenis pv tersebut dan cara menggunakannya. Sebagian besar, persistance volume menggunakan node dari tempat dideploynya pod. Hal tersebut kemungkinan besar memicu konflik direktori antara pod satu dan pod lainnya yang berbeda tujuan. Alasan lain yang mungkin adalah karena salah setting claim untuk persistance volume tersebut. 
-- Berdasarkan beberapa refensi, persistance volume aplikasi asli jarang sekali menggunakan hostPath. Biasanya menggunakan storage yang disediakan oleh cloud atau mengkonfigurasikannya sendiri pada node yang sesuai. Namun, penyusun laporan masih kurang paham caranya sehingga belum dapat dilakukan. 
-- Layanan meeting Jitsi hanya berhasil masuk sampai awal halaman, tetapi sering error saat klik mulai meeting. Terdapat banyak hal yang perlu dikonfigurasi dan kemungkinan terdapat salah konfigurasi. Aplikasi memerlukan self signed certificate untuk dapat dijalankan dengan HTTPS dan juga memerlukan domain, sehingga kemungkinan terdapat salah setting untuk bagian tersebut yang menyebabkan Jitsi tidak dapat dijalankan dan dilakukan testing video streaming. 
-- Layanan monitoring pada awalnya akan menggunakan Zabbix, tetapi konfigurasi Zabbix untuk Kubernetes cukup rumit sehingga belum dapat berjalan hingga saat ini dan akhirnya dicoba menggunakan kubernetes dashboard dengan limitasi tidak dapat melakukan monitoring secara historis atau hanya dapat melihat proses berjalannya saja dan kubernetes object mana yang berjalan atau tidak. Alternatif lainnya, penyusun laporan mencoba menggunakan layanan monitoring VM Instance bawaan dari Google Cloud Platform yang dapat diinstall dengan mudah. 
+Berikut adalah kendala yang dihadapi selama implementasi beserta **solusi teknis yang direkomendasikan** untuk memperbaikinya:
+
+### 1. Masalah Penjadwalan Wordpress (`nodeSelector`)
+
+**Masalah:** Wordpress tidak dapat berjalan dengan benar saat menggunakan `nodeSelector`, sehingga harus dibiarkan tanpa setting tersebut yang mengakibatkan pod ter-deploy secara acak.
+
+**Solusi Teknis:**
+Pastikan label pada node worker sudah sesuai. Untuk memastikan Wordpress berjalan di node yang tepat (misalnya `wprofile`), tambahkan konfigurasi `nodeSelector` pada `wordpress-deployment.yaml`:
+
+```yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        group: wprofile
+```
+Pastikan node target telah dilabeli dengan perintah: `kubectl label nodes <nama-node> group=wprofile`.
+
+### 2. Konflik MySQL & Persistence Volume
+
+**Masalah:** Terjadi konflik saat menjalankan beberapa MySQL di node `db` atau saat pod Wordpress dan Owncloud berjalan di node yang sama. Hal ini disebabkan karena semua konfigurasi Persistent Volume (PV) menggunakan direktori `hostPath` yang sama persis, yaitu `/mnt/data`. Akibatnya, data dari satu aplikasi menimpa data aplikasi lain.
+
+**Solusi Teknis:**
+Ubah konfigurasi PV untuk menggunakan sub-direktori yang unik untuk setiap layanan. Jangan arahkan semua ke `/mnt/data`.
+Contoh perubahan pada YAML:
+- **Wordpress MySQL:** `path: "/mnt/data/wordpress-db"`
+- **Wordpress Files:** `path: "/mnt/data/wordpress-files"`
+- **Owncloud MySQL:** `path: "/mnt/data/owncloud-db"`
+- **Owncloud Files:** `path: "/mnt/data/owncloud-files"`
+
+### 3. Penggunaan `hostPath` vs Cloud Storage
+
+**Masalah:** Penggunaan `hostPath` untuk produksi tidak disarankan karena data terikat pada node fisik tertentu. Jika pod pindah node, data tidak akan terbawa.
+
+**Solusi Teknis:**
+- **Untuk Bare Metal/VM Manual:** Jika ingin tetap menggunakan penyimpanan lokal, pastikan menggunakan path yang unik (seperti poin 2) dan gunakan `nodeSelector` agar pod selalu kembali ke node yang sama yang memiliki data tersebut.
+- **Rekomendasi Utama (GCP):** Gunakan **StorageClass** dengan provisioner `kubernetes.io/gce-pd`. Ini akan memungkinkan Kubernetes membuat Persistent Disk di GCP secara otomatis yang dapat di-mount ke node manapun pod berjalan.
+  Contoh:
+  ```yaml
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: standard
+  provisioner: kubernetes.io/gce-pd
+  parameters:
+    type: pd-standard
+  ```
+
+### 4. Konfigurasi Jitsi (HTTPS & IP)
+
+**Masalah:** Layanan Jitsi error saat memulai meeting.
+
+**Solusi Teknis:**
+- **IP Address:** Pastikan environment variable `DOCKER_HOST_ADDRESS` pada `deployment.yaml` diisi dengan **External IP** dari node tempat Jitsi berjalan, bukan IP internal atau IP dummy. Jitsi Video Bridge (JVB) memerlukan ini untuk koneksi WebRTC.
+- **SSL/HTTPS:** WebRTC modern membutuhkan koneksi HTTPS yang valid agar browser mengizinkan akses kamera/mikrofon. Self-signed certificate sering ditolak oleh browser. Solusinya adalah menggunakan domain asli dan mengonfigurasi Let's Encrypt, atau me-mount sertifikat SSL yang valid ke dalam container Jitsi.
+
+### 5. Kompleksitas Monitoring
+
+**Masalah:** Kesulitan konfigurasi Zabbix pada cluster Kubernetes.
+
+**Solusi Teknis:**
+Keputusan menggunakan **Google Cloud Operations Suite** (Monitoring VM Instance bawaan) sudah sangat tepat untuk infrastruktur berbasis VM di GCP karena instalasinya mudah (hanya install agent) dan terintegrasi langsung. Jika membutuhkan monitoring spesifik level Kubernetes (Pod/Container metrics) yang lebih mendalam di masa depan, pertimbangkan menggunakan stack **Prometheus & Grafana** yang merupakan standar industri untuk monitoring Kubernetes dan lebih mudah dikelola menggunakan Helm Charts.
 
 ## Referensi lain
 Tes file sharing 
